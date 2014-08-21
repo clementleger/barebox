@@ -194,6 +194,20 @@ config TSE_USE_DEDICATED_DESC_MEM
 	  reserved with a malloc but directly mapped to the memory
 	  address (defined in config.h)
 
+config DRIVER_NET_E1000
+	bool "Intel(R) PRO/1000 PCI Gigabit Ethernet support"
+	depends on PCI
+	select PHYLIB
+	---help---
+	  This driver supports the PCI-Express Intel(R) PRO/1000
+	  ethernet family of adapters.
+
+
+config E1000_NO_NVM
+	bool "Disable NVM support for PRO/1000 network cards"
+	depends on DRIVER_NET_E1000
+
+
 source "drivers/net/phy/Kconfig"
 source "drivers/net/usb/Kconfig"
 
