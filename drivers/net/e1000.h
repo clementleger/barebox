@@ -454,16 +454,11 @@ struct e1000_phy_stats {
 /* Receive Descriptor */
 struct e1000_rx_desc {
 	uint64_t buffer_addr;	/* Address of the descriptor's data buffer */
-	union {
-		uint64_t data;
-		struct {
-			uint16_t length;	/* Length of data DMAed into data buffer */
-			uint16_t csum;		/* Packet checksum */
-			uint8_t status;		/* Descriptor status */
-			uint8_t errors;		/* Descriptor Errors */
-			uint16_t special;
-		} fields;
-	};
+	uint16_t length;	/* Length of data DMAed into data buffer */
+	uint16_t csum;		/* Packet checksum */
+	uint8_t status;		/* Descriptor status */
+	uint8_t errors;		/* Descriptor Errors */
+	uint16_t special;
 };
 
 /* Receive Decriptor bit definitions */

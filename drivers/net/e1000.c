@@ -52,6 +52,10 @@ tested on both gig copper and gig fiber boards
 /* The TDLEN sdescriptor which holds the size must be aligned on a 128-bytes boundary */
 #define E1000_TX_DESC_COUNT	8
 #define E1000_TX_RING_SIZE	(E1000_TX_DESC_COUNT * sizeof(struct e1000_tx_desc))
+/* max supported ethernet frame size -- must be at least (dev->mtu+14+4).*/
+#define E1000_TX_PKT_SIZE	1536
+#define E1000_TX_BUF_SIZE	(E1000_TX_DESC_COUNT * E1000_TX_PKT_SIZE)
+#define E1000_TX_TOTAL_SIZE (E1000_TX_PKT_SIZE + E1000_TX_RING_SIZE)
 
 /* Same as TDLEN for RDLEN */
 #define E1000_RX_DESC_COUNT	8
@@ -136,8 +140,8 @@ struct e1000_priv {
 	struct e1000_hw		hw;
 
 	/* TX */
-	void 			*tx_ring;
-	dma_addr_t		tx_ring_dma;
+	void 			*tx_buffer;
+	dma_addr_t		tx_buffer_dma;
 	struct e1000_tx_desc	*tx_desc[E1000_TX_DESC_COUNT];
 	u32			tx_tail;
 
@@ -145,7 +149,6 @@ struct e1000_priv {
 	void 			*rx_buffer;
 	dma_addr_t		rx_buffer_dma;
 	struct e1000_rx_desc	*rx_desc[E1000_RX_DESC_COUNT];
-	void			*rx_pkt_buf[E1000_RX_DESC_COUNT];
 	u32			rx_tail;
 };
 
@@ -1817,7 +1820,7 @@ e1000_init_hw(struct eth_device *edev)
 		ctrl_ext |= E1000_CTRL_EXT_RO_DIS;
 		E1000_WRITE_REG(hw, CTRL_EXT, ctrl_ext);
 	}
-
+	e1000_dbg(priv, "Init hw done\n");
 	return ret_val;
 }
 
@@ -4983,15 +4986,15 @@ e1000_configure_tx(struct e1000_priv *priv)
 	struct e1000_hw *hw = &priv->hw;
 	unsigned int i;
 
-	priv->tx_ring = dma_alloc_coherent(E1000_TX_RING_SIZE, &priv->tx_ring_dma);
+	priv->tx_buffer = dma_alloc_coherent(E1000_TX_TOTAL_SIZE, &priv->tx_buffer_dma);
 
 	for (i = 0; i < E1000_TX_DESC_COUNT; i++) {
-		priv->tx_desc[i] = priv->tx_ring + (i * sizeof(struct e1000_tx_desc));
+		priv->tx_desc[i] = priv->tx_buffer + (i * sizeof(struct e1000_tx_desc));
 	}
 
 	priv->tx_tail = 0;
 
-	E1000_WRITE_REG(hw, TDBAL, (u32) priv->tx_ring_dma);
+	E1000_WRITE_REG(hw, TDBAL, (u32) priv->tx_buffer_dma);
 	E1000_WRITE_REG(hw, TDBAH, 0);
 
 	E1000_WRITE_REG(hw, TDLEN, E1000_TX_RING_SIZE);
@@ -4999,8 +5002,9 @@ e1000_configure_tx(struct e1000_priv *priv)
 	/* Setup the HW Tx Head and Tail descriptor pointers */
 	E1000_WRITE_REG(hw, TDH, 0);
 	E1000_WRITE_REG(hw, TDT, 0);
-
 	e1000_configure_hw_tx(hw);
+
+	e1000_dbg(priv, "TX configured\n");
 }
 
 /**
@@ -5047,7 +5051,7 @@ e1000_configure_rx(struct e1000_priv *priv)
 	unsigned long rctl, ctrl_ext;
 	unsigned int i;
 	struct e1000_hw *hw = &priv->hw;
-	void *buf_base, *buf_addr;
+	u32 dma_buf_addr;
 
 	/* make sure receives are disabled while setting up the descriptors */
 	rctl = E1000_READ_REG(hw, RCTL);
@@ -5065,15 +5069,17 @@ e1000_configure_rx(struct e1000_priv *priv)
 	}
 
 	priv->rx_buffer = dma_alloc_coherent(E1000_RX_TOTAL_SIZE, &priv->rx_buffer_dma);
-	buf_base = priv->rx_buffer + (E1000_RX_DESC_COUNT * sizeof(struct e1000_rx_desc));
+	dma_buf_addr = priv->rx_buffer_dma + E1000_RX_RING_SIZE;
 
 	for(i = 0; i < E1000_RX_DESC_COUNT; i++) {
 		priv->rx_desc[i] =  priv->rx_buffer + (i * sizeof(struct e1000_rx_desc));
-		buf_addr = buf_base + (i * sizeof(struct e1000_rx_desc));
-		priv->rx_pkt_buf[i] = buf_addr;
 		/* Initialize all packets */
-		priv->rx_desc[i]->buffer_addr = (u32) buf_addr;
-		priv->rx_desc[i]->data = 0;
+		priv->rx_desc[i]->buffer_addr = cpu_to_le64((u32) dma_buf_addr);
+		priv->rx_desc[i]->length = 0;
+		priv->rx_desc[i]->errors = 0;
+		priv->rx_desc[i]->csum = 0;
+		priv->rx_desc[i]->special = 0;
+		dma_buf_addr += E1000_RX_PKT_SIZE;
 	}
 
 	priv->rx_tail = E1000_RX_DESC_COUNT - 1;
@@ -5099,6 +5105,8 @@ static int e1000_eth_recv(struct eth_device *edev)
 	struct e1000_priv *priv = edev->priv;
 	struct e1000_rx_desc *next_rx_desc, *rx_tail_desc;
 	unsigned int next_rx_desc_idx;
+	u32 dma_pkt_addr;
+	void *pkt_addr;
 
 	next_rx_desc_idx = (priv->rx_tail + 1) % E1000_RX_DESC_COUNT;
 	next_rx_desc = priv->rx_desc[next_rx_desc_idx];
@@ -5106,18 +5114,22 @@ static int e1000_eth_recv(struct eth_device *edev)
 	/* FIXME: EOP check */
 
 	/* Check if the next descriptor is filled */
-	if (!(next_rx_desc->fields.status & E1000_RXD_STAT_DD))
+	if (!(next_rx_desc->status & E1000_RXD_STAT_DD))
 		return 0;
 
-	pkt_size = next_rx_desc->fields.length;
+	pkt_size = le16_to_cpu(next_rx_desc->length);
 	e1000_dbg(priv, "Packet received: %d bytes\n", pkt_size);
+	pkt_addr = priv->rx_buffer + E1000_RX_RING_SIZE + (next_rx_desc_idx * E1000_RX_PKT_SIZE);
+	net_receive(edev, pkt_addr, pkt_size);
 
-	net_receive(edev, priv->rx_pkt_buf[next_rx_desc_idx], pkt_size);
-
+	dma_pkt_addr = priv->rx_buffer_dma + E1000_RX_RING_SIZE + (next_rx_desc_idx * E1000_RX_PKT_SIZE);
 	/* Reset the tail descriptor */
 	rx_tail_desc = priv->rx_desc[priv->rx_tail];
-	rx_tail_desc->buffer_addr = (u32)priv->rx_pkt_buf[priv->rx_tail];
-	rx_tail_desc->data = 0;
+	rx_tail_desc->buffer_addr = cpu_to_le64((u32)dma_pkt_addr);
+	rx_tail_desc->length = 0;
+	rx_tail_desc->errors = 0;
+	rx_tail_desc->csum = 0;
+	rx_tail_desc->special = 0;
 
 	priv->rx_tail = next_rx_desc_idx;
 	E1000_WRITE_REG(&priv->hw, RDT, next_rx_desc_idx);
@@ -5132,17 +5144,21 @@ static int e1000_eth_send(struct eth_device *edev, void *packet,
 	struct e1000_tx_desc *tx_desc;
 	struct e1000_hw *hw = &priv->hw;
 	uint64_t start = get_time_ns();
-	u32 head;
+	u32 head, dma_pkt_addr;
+	void *pkt_addr;
 
+	e1000_dbg(priv, "e1000_eth_send\n");
+
+	dma_pkt_addr = priv->tx_buffer_dma + E1000_TX_RING_SIZE + (priv->tx_tail * E1000_TX_PKT_SIZE);
+	pkt_addr = priv->tx_buffer + E1000_TX_RING_SIZE + (priv->tx_tail * E1000_TX_PKT_SIZE);
 	tx_desc = priv->tx_desc[priv->tx_tail];
-	tx_desc->buffer_addr = (uint) packet;
+	tx_desc->buffer_addr = cpu_to_le64((u32)dma_pkt_addr);
 	/* Reset descriptor */
 	tx_desc->upper.data = 0;
-	tx_desc->lower.data = priv->hw.txd_cmd;
-	tx_desc->lower.flags.length = packet_length;
-
+	tx_desc->lower.data = cpu_to_le32(hw->txd_cmd | packet_length);
 	priv->tx_tail = (priv->tx_tail + 1) % E1000_TX_DESC_COUNT;
 
+	memcpy(pkt_addr, packet, packet_length);
 
 	/* Send the packet */
 	E1000_WRITE_REG(hw, TDT, priv->tx_tail);
@@ -5166,7 +5182,7 @@ wait_dd:
 	/* descriptor is beeing sent by the DMA, *
 	 * wait for the descriptor to be done */
 	while (!is_timeout(start, 100 * MSECOND)) {
-		if (tx_desc->upper.fields.status & E1000_TXD_STAT_DD) {
+		if (le32_to_cpu(tx_desc->upper.data) & E1000_TXD_STAT_DD) {
 			e1000_dbg(priv, "Descriptor %p done\n", tx_desc);
 			return 0;
 		}
@@ -5196,6 +5212,7 @@ e1000_eth_halt(struct eth_device *edev)
 	struct e1000_priv *priv = edev->priv;
 	struct e1000_hw *hw = &priv->hw;
 
+	e1000_dbg(priv, "e1000_eth_halt\n");
 	/* Turn off the ethernet interface */
 	E1000_WRITE_REG(hw, RCTL, 0);
 	E1000_WRITE_REG(hw, TCTL, 0);
@@ -5218,6 +5235,7 @@ static int e1000_eth_open(struct eth_device *edev)
 	struct e1000_hw *hw = &priv->hw;
 	int ret_val;
 
+	e1000_dbg(priv, "e1000_eth_open\n");
 	ret_val = e1000_reset(edev);
 	if (ret_val < 0) {
 		if ((ret_val == -E1000_ERR_NOLINK) ||
@@ -5232,6 +5250,7 @@ static int e1000_eth_open(struct eth_device *edev)
 	e1000_configure_tx(priv);
 	e1000_setup_rctl(hw);
 	e1000_configure_rx(priv);
+	e1000_dbg(priv, "Device configured to send and receive packets\n");
 
 	return 0;
 }
